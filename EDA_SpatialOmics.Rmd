@@ -1,0 +1,371 @@
+---
+title: "Exploratory Analyses of Visium and Xenium datasets using VoltRon - CompGen workshop 2025"
+author: "Muhunden Jayakrishnan"
+date: "3/5/2025"
+output: html_document
+---
+
+We explore spatial transcriptomics datasets (Xenium : Imaging based ; Visium : Sequencing based) using VoltRon.
+Load necessary prerequisites. VoltRon requires R > 4.4.
+
+```{r setup, include=FALSE}
+
+options(java.parameters = "-Xmx8g")  ## Otherwise memory issues while dealing with Xenium Data
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(VoltRon)
+library(dplyr)
+library(rhdf5)
+library(Seurat)
+library(patchwork)
+library(spacexr)
+library(ComplexHeatmap)
+library(RBioFormats)
+library(ImageArray)
+library(BPCells)
+library(HDF5DataFrame)
+
+setwd("/Users/ra36doj/Desktop/mount/singleCell/VoltRon/CompGen_2025/workshop/scripts/")
+
+
+```
+
+## Visium Analysis
+
+In the first section, we explore Mouse brain Visium dataset for two tissue sections, anterior and posterior. VoltRon allows multilayer data objects, allowing different tissue blocks, adjacent sections and multi-omics methods to be stored within a single object. Data is from Mouse Brain.
+
+We load each experiment separately and merge into a single object. 
+
+```{r LoadData}
+
+Ant_Sec1 <- importVisium("../data/Mouse Brain/Sagittal_Anterior/Section1/",
+                         sample_name = "Anterior1")
+Pos_Sec1 <- importVisium("../data/Mouse Brain/Sagittal_Posterior/Section1/",
+                         sample_name = "Posterior1")
+
+MBrain_Sec <- merge(Ant_Sec1, Pos_Sec1)
+
+MBrain_Sec
+```
+
+Voltron data accessors are similar to Seurat. You have data slots for different assays which each contain meta+raw data. 
+
+The raw counts matrix represent RNA counts for each gene for each spatial barcode of the spot. Remember that Visium data quantifies data at a spot level, which may consist of multiple genes.
+
+```{r}
+
+str(MBrain_Sec)
+
+SampleMetadata(MBrain_Sec)
+
+MBrain_Sec[["Assay1"]]@data$RNA[1:10,1:10]  
+
+```
+
+
+VoltRon workflow is very similar to Seurat's single cell analysis workflow. Normalization -> Feature Selection -> PCA -> UMAP -> Clustering -> Vizualisation
+
+Normalization is performed by logNorm Transform : Normalize for read depth and log transform. This is analogous to TPM transformation by DESeq2.
+
+```{r Normalize}
+
+head(vrFeatures(MBrain_Sec)) ##gene names 
+length(vrFeatures(MBrain_Sec))
+
+# normalize and select features
+MBrain_Sec <- normalizeData(MBrain_Sec)
+
+```
+
+TPM transformation is not suited for INTERSAMPLE comparisons. To calculate variable features, Variance Stabilizing Transformation (VST) is applied. logNorm Transformation is NOT a homoscedastic transformation .i.e., variance is not constant over the entire range of RNA mean count values. VST is more appropriate for comparison across samples as it corrects for this mean-dispersion relationship. This is important as a key assumption of linear regression (Ordinary Least Squares) assumes that this distribution is homoscedastic (see comment from DESEQ2 developer here https://support.bioconductor.org/p/103983/)
+
+
+```{r GetFeatures}
+MBrain_Sec <- getFeatures(MBrain_Sec, n = 3000)
+
+# selected features
+head(vrFeatureData(MBrain_Sec))
+
+vrFeatureData(MBrain_Sec) %>% as.data.frame() %>% filter(rank!=0) %>% arrange(rank) %>% head(n=10)  ### top n variable features 
+
+
+selected_features <- getVariableFeatures(MBrain_Sec)
+head(selected_features, 20)  ### alternate approach to get the most variable features -> Should match with above approach
+
+```
+
+We have selected 3000 most variable features which will be used for PCA. We use 30 of the most informative Principal Components for UMAP (note that ideally you need to perform an elbow analysis (cumulative % variance explained vs number of PCs) to pick the ideal number).
+
+```{r}
+
+# embedding
+MBrain_Sec <- getPCA(MBrain_Sec, features = selected_features, dims = 30)
+MBrain_Sec <- getUMAP(MBrain_Sec, dims = 1:30)
+vrEmbeddingNames(MBrain_Sec)
+
+vrEmbeddingPlot(MBrain_Sec, embedding = "umap")
+
+```
+
+We can observe that both sections cluster separately (batch effect) and within each section, there are variable number of clusters. We can now extract clusters using Leiden-based Graph Clustering (SNN: shared nearest neighbours), which works on the assumption that nodes that share a lot of neighbours must belong to the same neighbourhood. 
+
+```{r GetClusters}
+MBrain_Sec <- getProfileNeighbors(MBrain_Sec, dims = 1:30, k = 10, method = "SNN")
+vrGraphNames(MBrain_Sec)
+
+# clustering
+MBrain_Sec <- getClusters(MBrain_Sec, resolution = 0.5, label = "Clusters", graph = "SNN")
+
+```
+We can visualize these clusters of spots that have similar expression profile using their UMAP embeddings. We can then overlay these cluster annotations back on the 
+Visium tissue section.
+
+```{r Viz_Clusters}
+
+vrEmbeddingPlot(MBrain_Sec, embedding = "umap", group.by = "Clusters")
+
+vrSpatialPlot(MBrain_Sec,group.by = "Clusters")
+
+
+```
+
+We can observe the presence of different spot neighbourhoods. OF NOTE, there is a strong batch effect where Posterior and Anterior spot types cluster separately. There may be many shared spots between the two sections but they can only be obtained by ALIGNMENT + INTEGRATION (similar to Seurat) which will be explored later.
+
+So far, we have managed to cluster spots, but each spot can have multiple cells. To get which 'kinds' of cells are located within spots, you need to use a scRNAseq reference dataset to 'deconvolve' which kinds of cells are located within a given spot. 
+
+First we load a SeuratObject containing reference scRNAseq for similar tissue section from Allen Institute and then visualize the annotated single cell identities.
+
+Class contains the large groupings while Subclass identity is annotated cell type.
+
+```{r LoadVizRefDataset}
+
+allen_reference <- readRDS("../data/Mouse Brain/scRNA Mouse Brain/allen_cortex_analyzed_subset.rds")
+
+Idents(allen_reference) <- "subclass"
+gsubclass <- DimPlot(allen_reference, reduction = "umap", label = T) + NoLegend()
+Idents(allen_reference) <- "class"
+gclass <- DimPlot(allen_reference, reduction = "umap", label = T) + NoLegend()
+gsubclass | gclass
+
+```
+
+Now, we use the tool spacexr to deconvolve the spot-level expression profile (RNA counts) of 33000 genes into proportions of the 22 cell types (notice the output features as well as data structure). 
+
+```{r SpaceXr}
+
+# (OPTIONAL) deconvolute spots, - TAKES A LOT OF TIME !
+#MBrain_Sec <- getDeconvolution(MBrain_Sec, sc.object = allen_reference,
+#                               sc.cluster = "subclass", max_cores = 2)
+
+# Load the object with Deconvolved spots
+MBrain_Sec <- readRDS("../data/Mouse Brain/MBrain_Sec_decon.rds")
+
+MBrain_Sec[["Assay1"]]@data$RNA[1:10,1:10] #original datastructure
+head(vrFeatures(MBrain_Sec))
+
+vrMainFeatureType(MBrain_Sec) <- "Decon" ##change main feature to Decon
+vrFeatures(MBrain_Sec)
+
+```
+
+Note that Deconvolved features also have a normalized version, which are proportion values modified by Center Log Transformation. Only this version can be used to perform UMAPs etc as standard proportion data violate assumptions regarding Euclidean distances which are used in clustering algorithms. 
+
+```{r}
+
+MBrain_Sec[["Assay1"]]@data$Decon_norm[,1:5] 
+
+```
+
+Vizualize proportion of selected features across the tissue.
+
+```{r FeaturePlot, fig.height=10,fig.width=15}
+vrSpatialFeaturePlot(MBrain_Sec, features = c("L4", "L5 PT", "Oligo", "Vip"),
+                     crop = TRUE, ncol = 2, alpha = 1, keep.scale = "all")
+```
+
+Normalize proportions and perform UMAP. Visium spots with similar proportions of cells will be clustered together !
+
+```{r}
+
+vrMainFeatureType(MBrain_Sec) <- "Decon"
+MBrain_Sec <- normalizeData(MBrain_Sec, method = "CLR")
+MBrain_Sec <- getUMAP(MBrain_Sec, data.type = "norm", umap.key = "umap_niche")
+vrEmbeddingPlot(MBrain_Sec, embedding = "umap_niche", group.by = "Sample")
+
+```
+
+Get clusters based on Shared Nearest Neighbours
+
+```{r}
+# clustering
+MBrain_Sec <- getProfileNeighbors(MBrain_Sec, data.type = "norm", method = "SNN", graph.key = "SNN_niche")
+MBrain_Sec <- getClusters(MBrain_Sec, resolution = 0.4, graph = "SNN_niche", label = "Niche_Clusters")
+
+# visualize clustering
+g1 <- vrEmbeddingPlot(MBrain_Sec, embedding = "umap", group.by = "Sample")
+g2 <- vrEmbeddingPlot(MBrain_Sec, embedding = "umap", group.by = "Niche_Clusters", label = TRUE)
+g1 | g2
+```
+
+Vizualize UMAP clusters overlaid onto the tissue level spots. Some distant regions on the tissue may share a similar type of cellular niche !
+
+```{r}
+# spatial clustering plot
+vrSpatialPlot(MBrain_Sec, group.by = "Niche_Clusters", crop = TRUE, alpha = 1)
+```
+
+We can look at what cell types define certain cellular niches using a heatmap.
+
+```{r}
+
+vrHeatmapPlot(MBrain_Sec, features = vrFeatures(MBrain_Sec), group.by = "Niche_Clusters",
+              show_row_names = T, show_heatmap_legend = T)
+```
+
+
+## Xenium Analysis
+
+Unlike Visium datasets, Xenium datasets are very large as they store coordinates of each molecule. Further, as its imaging-based, the images need to be stored in a multi-resolution format (similar to HiC matrices). Voltron recommends treating Xenium data in on-disk (non-memory) formats. The storage format is HDF5 and treats data similar to BPCells for single-cell data.
+
+```{r}
+
+Xen_R1 <- importXenium("../data/BreastCancer/Xenium_R1/outs/", 
+                       sample_name = "XeniumR1", 
+                       overwrite_resolution = TRUE, 
+                       resolution_level = 3)
+
+# Metadata
+Xen_R1@metadata
+head(Metadata(Xen_R1))
+
+# filter out counts
+Xen_R1 <- subset(Xen_R1, Count > 5)
+
+```
+Save the Xenium object ondisk. Now all operations will be performed and evaluated LAZILY (as opposed to eager execution).
+
+```{r}
+#Not necessary to repeat the object save.
+
+# Xen_R1_ondisk <- saveVoltRon(Xen_R1, 
+#                              format = "HDF5VoltRon", 
+#                              output = "./workshop/data/ondisk/Xen_R1", 
+#                              replace = TRUE)
+
+# load voltron from disk
+Xen_R1_ondisk <- loadVoltRon("../data/ondisk/Xen_R1/")
+
+```
+
+Perform operations one cell-level counts. Note that cell level mRNA counts are generated using an additional segmentation reference channel (like cell boundary immunostatining)
+
+```{r}
+
+# normalize
+Xen_R1_ondisk <- normalizeData(Xen_R1_ondisk, sizefactor = 1000)
+
+# PCA reduction
+Xen_R1_ondisk <- getPCA(Xen_R1_ondisk, dims = 20, overwrite = TRUE)
+Xen_R1_ondisk <- getUMAP(Xen_R1_ondisk, dims = 1:20, overwrite=TRUE)
+
+vrEmbeddingPlot(Xen_R1_ondisk, embedding="umap")
+
+```
+
+Some diagnostic plots.
+
+```{r}
+
+# neighbors
+Xen_R1_ondisk <- getProfileNeighbors(Xen_R1_ondisk, dims = 1:20, method = "SNN")
+vrGraphNames(Xen_R1_ondisk)
+
+# clustering
+Xen_R1_ondisk <- getClusters(Xen_R1_ondisk, resolution = 1.3, label = "Clusters", graph = "SNN")
+
+# visualization
+vrEmbeddingPlot(Xen_R1_ondisk, group.by = "Clusters", embedding = "umap", 
+                pt.size = 0.4, label = TRUE)
+
+# spatial plot
+vrSpatialPlot(Xen_R1_ondisk, group.by = "Clusters", pt.size = 0.18)
+
+```
+
+Its possible to perform 'Marker' analyses like for single-cell RNAseq data. Voltron can transform objects into Seurat objects which can then be used with FindAllMarkers (which will identify cluster specific markers).
+
+```{r}
+Xen_R1$Clusters <- Xen_R1_ondisk$Clusters
+Xen_R1_seu <- VoltRon::as.Seurat(Xen_R1, cell.assay = "Xenium", type = "image")
+Idents(Xen_R1_seu) <- "Clusters"
+Xen_R1_seu <- NormalizeData(Xen_R1_seu, scale.factor = 1000)
+markers <- FindAllMarkers(Xen_R1_seu)
+
+head(markers,n=10)
+
+```
+
+These markers can be used to classify cell types by an expert. Load predefined annotations and perform Niche Clustering Analysis.
+
+In Visium, we deconvolve spots to get mixture of cells and then identify niches based on neighbouring spots that have same cell composition. In xenium, there are no spots, but rather we directly use the position of cells to identify neighbour cell types (and consequently define niches).
+
+```{r}
+Xen_R1_ondisk <- getSpatialNeighbors(Xen_R1_ondisk, radius = 30, method = "radius")
+vrGraphNames(Xen_R1_ondisk)
+
+# get niche assay
+Xen_R1_ondisk <- getNicheAssay(Xen_R1_ondisk, label = "CellType", graph.type = "radius")
+Xen_R1_ondisk
+
+# normalizing niche assay
+vrMainFeatureType(Xen_R1_ondisk) <- "Niche"
+Xen_R1_ondisk <- normalizeData(Xen_R1_ondisk, method = "CLR")
+
+# clustering niches
+Xen_R1_ondisk <- getClusters(Xen_R1_ondisk, nclus = 9, method = "kmeans", label = "niche_clusters")
+
+# visualization
+vrSpatialPlot(Xen_R1_ondisk, group.by = "niche_clusters", alpha = 1)
+library(ComplexHeatmap)
+vrHeatmapPlot(Xen_R1_ondisk, features = vrFeatures(Xen_R1_ondisk), group.by = "niche_clusters")
+
+# visualization of specific cell type
+#vrSpatialPlot(Xen_R1_ondisk, group.by = "CellType", pt.size = 0.18, alpha = 1, group.ids = c("ACTA2_myoepithelial", "KRT15_myoepithelial"))
+vrSpatialPlot(Xen_R1_ondisk, group.by = "CellType", pt.size = 1, alpha = 1, group.ids = c("CD4_TCells", "CD8_TCells", "BCells"), n.tile = 400)
+```
+
+Hostpot analysis: Use Getis-Ord statistics to identify hotspots for a given feature. In other words, for a given feature, you compare local and global means to identify clusters of cells that have very high or very low values for the feature. Sample analyses for PGR gene expression. First you obtain a local cellular neighbourhood (cells contained within a ball of given radius) and perform hotspot analyses for PGR RNA counts.
+
+```{r}
+
+# get spatial neighbor plot
+Xen_R1_ondisk <- getSpatialNeighbors(Xen_R1_ondisk, method = "radius", radius = 15, graph.key = "radius_hot")
+
+# visualize 
+vrMainFeatureType(Xen_R1_ondisk) <- "RNA"
+vrSpatialFeaturePlot(Xen_R1_ondisk, features = "PGR", alpha = 1, background.color = "black", n.tile = 300)
+
+# analysis 
+Xen_R1_ondisk <- getHotSpotAnalysis(Xen_R1_ondisk, features = "PGR", graph.type = "radius_hot", alpha.value = 0.001)
+
+# visualize
+vrSpatialFeaturePlot(Xen_R1_ondisk, features = "PGR_hotspot_stat", alpha = 1, background.color = "black", n.tile = 400)
+vrSpatialPlot(Xen_R1_ondisk, group.by = "PGR_hotspot_flag", alpha = 1, background.color = "black", n.tile = 400)
+
+```
+
+Multimodal Image Alignment/Registration: VoltRon allows you to align multimodal data (for example Immunofluoresence or H&E staining) from the same or adjacent tissue sections. This can be done either manually (user selects equivalent points between two images) or automatically. Note: The below code chunk requires use of shiny and runs into issue with RMd, so see reference screenshot. The query image is the H&E staining from a Visium experiment (left) while reference image is Xenium experiment from adjacent tissue. Better to downscale resolution as otherwise the alignment focuses (erroneously) onto small scale fine details. The bottom row shows connected points and overlay of query onto reference. 
+
+```{r}
+
+# HW_Xen_R1_ondisk <- loadVoltRon("../data/ondisk/Xen_R1/")
+# HW_Vis <- importVisium("../data/BreastCancer/Visium/")
+# 
+# HW_reg <- registerSpatialData(object_list = list(HW_Vis, HW_Xen_R1_ondisk))
+
+knitr::include_graphics(normalizePath("../Assignment_Registration.pdf"))
+
+```
+
+Now transformed coordinates will be available for the query image. These coordinates can be used to map back to the reference and viz them side-by-side. Same way, one can add manual ROIs onto Xenium images for ROI specific quantifications etc. 
